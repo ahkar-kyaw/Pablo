@@ -1,13 +1,18 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <U8x8lib.h>
-#include <Servo.h>
+#include <stdarg.h>
+#include <math.h>
 
 #include "LSM6DS3.h"
 
+// NRF52 ISR Servo
+#define TIMER_INTERRUPT_DEBUG 0
+#define ISR_SERVO_DEBUG 0
+#include "NRF52_ISR_Servo.h"
+
 // -----------------------------
 // Easy mode switch
-// Change START_MODE to ControlMode::UART or ControlMode::IMU
 // -----------------------------
 enum class ControlMode : uint8_t { UART, IMU };
 static constexpr ControlMode START_MODE = ControlMode::UART;
@@ -21,7 +26,6 @@ FsmState g_state = FsmState::BOOT;
 
 // -----------------------------
 // OLED
-// Expansion Base uses SSD1306 128x64 on I2C, no reset pin
 // -----------------------------
 U8X8_SSD1306_128X64_NONAME_HW_I2C g_oled(U8X8_PIN_NONE, SCL, SDA);
 
@@ -35,7 +39,6 @@ static constexpr uint32_t OLED_UPDATE_MS = 100;
 uint32_t g_lastOledUpdateMs = 0;
 bool g_heartbeat = false;
 
-// Small rolling log on the bottom 3 lines
 static constexpr uint8_t LOG_LINES = 3;
 char g_log[LOG_LINES][OLED_COLS + 1];
 uint8_t g_logHead = 0;
@@ -52,7 +55,6 @@ static void oledWriteLine(uint8_t row, const char* s) {
 }
 
 static void oledPushLog(const char* msg) {
-  // Store at head
   strncpy(g_log[g_logHead], msg, OLED_COLS);
   g_log[g_logHead][OLED_COLS] = '\0';
   g_logHead = (uint8_t)((g_logHead + 1) % LOG_LINES);
@@ -72,9 +74,9 @@ static void oledPushLogFmt(const char* fmt, ...) {
 }
 
 // -----------------------------
-// Pins
+// Pins and UART
 // -----------------------------
-static constexpr uint8_t SERVO_PIN = D1;  // Keep away from D4 SDA and D5 SCL used by OLED I2C
+static constexpr uint8_t SERVO_PIN = D1;
 static constexpr uint32_t UART_BAUD = 115200;
 
 // -----------------------------
@@ -83,6 +85,12 @@ static constexpr uint32_t UART_BAUD = 115200;
 static constexpr int SERVO_HARD_MIN_DEG = 0;
 static constexpr int SERVO_HARD_MAX_DEG = 180;
 
+// These microseconds define the electrical end stops for the servo pulses.
+// For many small servos, something like 800..2450 is reasonable.
+// Tune these for your servo if needed.
+static constexpr int SERVO_MIN_US = 800;
+static constexpr int SERVO_MAX_US = 2450;
+
 int g_softMinDeg = 20;
 int g_softMaxDeg = 160;
 int g_failsafeDeg = 90;
@@ -90,7 +98,7 @@ int g_failsafeDeg = 90;
 static constexpr uint32_t SERVO_UPDATE_MS = 10;
 static constexpr float SERVO_MAX_DEG_PER_SEC = 120.0f;
 
-Servo g_servo;
+int g_servoIndex = -1;
 float g_servoCmdDeg = 90.0f;
 float g_servoAppliedDeg = 90.0f;
 uint32_t g_lastServoUpdateMs = 0;
@@ -160,19 +168,6 @@ static void setServoTargetDeg(int deg) {
 
 // -----------------------------
 // UART protocol
-//
-// Angle command
-//   0..180
-//
-// Mode command
-//   MODE UART
-//   MODE IMU
-//
-// Safety limits
-//   LIMIT <minDeg> <maxDeg>
-//
-// Failsafe position
-//   FAILSAFE <deg>
 // -----------------------------
 static void handleUartLine(const char* line) {
   char tmp[UART_BUF_LEN];
@@ -224,7 +219,6 @@ static void handleUartLine(const char* line) {
     return;
   }
 
-  // Angle command
   int deg = atoi(tok1);
   setServoTargetDeg(deg);
   oledPushLogFmt("Ang %d", clampServoDeg(deg));
@@ -240,11 +234,8 @@ static void pollUart() {
       if (g_uartLen > 0) handleUartLine(g_uartBuf);
       g_uartLen = 0;
     } else if (c != '\r') {
-      if (g_uartLen + 1 < UART_BUF_LEN) {
-        g_uartBuf[g_uartLen++] = c;
-      } else {
-        g_uartLen = 0;
-      }
+      if (g_uartLen + 1 < UART_BUF_LEN) g_uartBuf[g_uartLen++] = c;
+      else g_uartLen = 0;
     }
   }
 }
@@ -266,6 +257,8 @@ static void updateImuTarget() {
 }
 
 static void updateServo() {
+  if (g_servoIndex < 0) return;
+
   uint32_t now = millis();
   if (now - g_lastServoUpdateMs < SERVO_UPDATE_MS) return;
 
@@ -279,7 +272,7 @@ static void updateServo() {
   else g_servoAppliedDeg += (err > 0.0f) ? maxStep : -maxStep;
 
   int outDeg = clampServoDeg((int)(g_servoAppliedDeg + 0.5f));
-  g_servo.write(outDeg);
+  NRF52_ISR_Servos.setPosition(g_servoIndex, outDeg);
 }
 
 // Build and render 8 text rows
@@ -294,49 +287,32 @@ static void updateOledUI() {
     g_screen[r][OLED_COLS] = '\0';
   }
 
-  // Row 0
-  {
-    const char* st = (g_state == FsmState::RUN) ? "RUN" : (g_state == FsmState::FAILSAFE ? "SAFE" : "BOOT");
-    snprintf(g_screen[0], OLED_COLS + 1, "ServoCtl %s %c", st, g_heartbeat ? '*' : ' ');
+  const char* st = (g_state == FsmState::RUN) ? "RUN" : (g_state == FsmState::FAILSAFE ? "SAFE" : "BOOT");
+  snprintf(g_screen[0], OLED_COLS + 1, "ServoCtl %s %c", st, g_heartbeat ? '*' : ' ');
+
+  const char* md = (g_mode == ControlMode::UART) ? "UART" : "IMU";
+  snprintf(g_screen[1], OLED_COLS + 1, "Mode %s", md);
+
+  int cmd = clampServoDeg((int)(g_servoCmdDeg + 0.5f));
+  int out = clampServoDeg((int)(g_servoAppliedDeg + 0.5f));
+  snprintf(g_screen[2], OLED_COLS + 1, "Cmd%3d Out%3d", cmd, out);
+
+  snprintf(g_screen[3], OLED_COLS + 1, "Lim%3d %3d FS%3d", g_softMinDeg, g_softMaxDeg, g_failsafeDeg);
+
+  if (g_mode == ControlMode::UART) {
+    uint32_t age = millis() - g_lastUartRxMs;
+    if (age > 999) age = 999;
+    snprintf(g_screen[4], OLED_COLS + 1, "UART age %3lums", (unsigned long)age);
+  } else {
+    int p = (int)(g_pitchDegFiltered + (g_pitchDegFiltered >= 0 ? 0.5f : -0.5f));
+    snprintf(g_screen[4], OLED_COLS + 1, "Pitch %4d deg", p);
   }
 
-  // Row 1
-  {
-    const char* md = (g_mode == ControlMode::UART) ? "UART" : "IMU";
-    snprintf(g_screen[1], OLED_COLS + 1, "Mode %s", md);
-  }
-
-  // Row 2
-  {
-    int cmd = clampServoDeg((int)(g_servoCmdDeg + 0.5f));
-    int out = clampServoDeg((int)(g_servoAppliedDeg + 0.5f));
-    snprintf(g_screen[2], OLED_COLS + 1, "Cmd%3d Out%3d", cmd, out);
-  }
-
-  // Row 3
-  {
-    snprintf(g_screen[3], OLED_COLS + 1, "Lim%3d %3d FS%3d", g_softMinDeg, g_softMaxDeg, g_failsafeDeg);
-  }
-
-  // Row 4
-  {
-    if (g_mode == ControlMode::UART) {
-      uint32_t age = millis() - g_lastUartRxMs;
-      if (age > 999) age = 999;
-      snprintf(g_screen[4], OLED_COLS + 1, "UART age %3lums", (unsigned long)age);
-    } else {
-      int p = (int)(g_pitchDegFiltered + (g_pitchDegFiltered >= 0 ? 0.5f : -0.5f));
-      snprintf(g_screen[4], OLED_COLS + 1, "Pitch %4d deg", p);
-    }
-  }
-
-  // Rows 5 to 7 log lines oldest to newest
   for (uint8_t i = 0; i < LOG_LINES; i++) {
     uint8_t idx = (uint8_t)((g_logHead + i) % LOG_LINES);
     snprintf(g_screen[5 + i], OLED_COLS + 1, "%-16s", g_log[idx]);
   }
 
-  // Render only changed lines
   for (uint8_t r = 0; r < OLED_ROWS; r++) {
     if (strncmp(g_screen[r], g_screenPrev[r], OLED_COLS) != 0) {
       oledWriteLine(r, g_screen[r]);
@@ -352,26 +328,26 @@ void setup() {
   g_oled.setFlipMode(1);
   g_oled.setFont(u8x8_font_chroma48medium8_r);
 
-  for (uint8_t r = 0; r < OLED_ROWS; r++) {
-    g_screenPrev[r][0] = '\0';
-  }
-  for (uint8_t i = 0; i < LOG_LINES; i++) {
-    snprintf(g_log[i], OLED_COLS + 1, "%-16s", "");
-  }
+  for (uint8_t r = 0; r < OLED_ROWS; r++) g_screenPrev[r][0] = '\0';
+  for (uint8_t i = 0; i < LOG_LINES; i++) snprintf(g_log[i], OLED_COLS + 1, "%-16s", "");
 
   oledPushLog("Boot");
 
-  // UART for commands on Serial1
   Serial1.begin(UART_BAUD);
   g_lastUartRxMs = millis();
 
-  // Servo init
-  g_servo.attach(SERVO_PIN);
-  setServoTargetDeg(g_failsafeDeg);
-  g_servoAppliedDeg = g_servoCmdDeg;
-  g_servo.write((int)g_servoAppliedDeg);
+  // Servo init via NRF52_ISR_Servo
+  g_servoIndex = NRF52_ISR_Servos.setupServo(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
+  if (g_servoIndex < 0) {
+    oledPushLog("Servo init err");
+    g_state = FsmState::FAILSAFE;
+  } else {
+    oledPushLog("Servo ok");
+    setServoTargetDeg(g_failsafeDeg);
+    g_servoAppliedDeg = g_servoCmdDeg;
+    NRF52_ISR_Servos.setPosition(g_servoIndex, clampServoDeg((int)g_servoAppliedDeg));
+  }
 
-  // IMU init
   g_imuOk = (g_imu.begin() == 0);
   oledPushLog(g_imuOk ? "IMU ok" : "IMU err");
 
@@ -379,7 +355,7 @@ void setup() {
   g_lastImuUpdateMs = millis();
   g_lastOledUpdateMs = millis();
 
-  g_state = FsmState::RUN;
+  if (g_state != FsmState::FAILSAFE) g_state = FsmState::RUN;
   oledPushLog("Ready");
 }
 
@@ -389,12 +365,11 @@ void loop() {
   pollUart();
 
   switch (g_state) {
-    case FsmState::BOOT: {
+    case FsmState::BOOT:
       g_state = FsmState::RUN;
       break;
-    }
 
-    case FsmState::RUN: {
+    case FsmState::RUN:
       if (g_mode == ControlMode::UART) {
         if ((now - g_lastUartRxMs) > UART_TIMEOUT_MS) {
           g_state = FsmState::FAILSAFE;
@@ -409,16 +384,13 @@ void loop() {
           updateImuTarget();
         }
       }
-
       updateServo();
       break;
-    }
 
-    case FsmState::FAILSAFE: {
+    case FsmState::FAILSAFE:
       setServoTargetDeg(g_failsafeDeg);
       updateServo();
 
-      // Exit conditions
       if (g_mode == ControlMode::UART) {
         if ((now - g_lastUartRxMs) <= UART_TIMEOUT_MS) {
           g_state = FsmState::RUN;
@@ -431,7 +403,6 @@ void loop() {
         }
       }
       break;
-    }
   }
 
   updateOledUI();
