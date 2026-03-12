@@ -15,7 +15,7 @@
 // Easy mode switch
 // -----------------------------
 enum class ControlMode : uint8_t { UART, IMU };
-static constexpr ControlMode START_MODE = ControlMode::UART;
+static constexpr ControlMode START_MODE = ControlMode::IMU;
 volatile ControlMode g_mode = START_MODE;
 
 // -----------------------------
@@ -321,12 +321,26 @@ static void updateOledUI() {
   }
 }
 
+static void i2cScanToLog() {
+  oledPushLog("I2C scan");
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    uint8_t err = Wire.endTransmission();
+    if (err == 0) {
+      oledPushLogFmt("I2C 0x%02X", addr);
+      delay(50);
+    }
+  }
+}
+
 void setup() {
   Wire.begin();
 
   g_oled.begin();
   g_oled.setFlipMode(1);
   g_oled.setFont(u8x8_font_chroma48medium8_r);
+
+  i2cScanToLog();
 
   for (uint8_t r = 0; r < OLED_ROWS; r++) g_screenPrev[r][0] = '\0';
   for (uint8_t i = 0; i < LOG_LINES; i++) snprintf(g_log[i], OLED_COLS + 1, "%-16s", "");
