@@ -18,6 +18,7 @@ class UIEventType(Enum):
     LOAD_IMAGE_FILENAME = auto()
     QUIT = auto()
     HELP = auto()
+    DRAW_ANIMATE = auto()
 
 
 @dataclass(frozen=True)
