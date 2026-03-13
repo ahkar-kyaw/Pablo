@@ -11,7 +11,8 @@ from kinematics_engine import CartesianWaypoint, DrawingPlane, KinematicsEngine
 from tool_axis_link import ToolAxisLink
 from vision_processor import DrawingJobSpec, VisionProcessor
 from ui_handler import UIEvent, UIEventType
-
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 
 class RobotState(Enum):
     IDLE = auto()
@@ -19,6 +20,7 @@ class RobotState(Enum):
     DRAWING = auto()
     PAUSED = auto()
     EMERGENCY_STOP = auto()
+    DRAW_ANIMATE = auto()
 
 
 @dataclass
@@ -138,6 +140,11 @@ class RobotController:
             if self.state == RobotState.IDLE:
                 self._transition(RobotState.CALIBRATING)
             return
+        
+        if ev.event_type == UIEventType.DRAW_ANIMATE:
+            self._job_runtime = None
+            self._transition(RobotState.DRAW_ANIMATE)
+            return
 
     def _transition(self, new_state: RobotState) -> None:
         if new_state == self.state:
@@ -161,6 +168,8 @@ class RobotController:
             self._paused_step()
         elif self.state == RobotState.EMERGENCY_STOP:
             self._estop_step()
+        elif self.stae == RobotState.DRAW_ANIMATE:
+            self._animate_draw()
 
     def _idle_step(self) -> None:
         led = np.array([0, 1, 0], dtype=float)
@@ -190,7 +199,7 @@ class RobotController:
             self._transition(RobotState.EMERGENCY_STOP)
             return
 
-        self._transition(RobotState.DRAWING)
+        self._transition(RobotState.DRAW_ANIMATE)
 
     def _drawing_step(self) -> None:
         led = np.array([1, 1, 1], dtype=float)
@@ -234,3 +243,102 @@ class RobotController:
     def _estop_step(self) -> None:
         led = np.array([1, 0, 0], dtype=float)
         self.io.send(self._last_phi_cmd, self._last_grip_cmd, led_rgb=led)
+
+    def animate_draw(self) -> None:
+        
+        if self._job_runtime is None or not self._job_runtime.waypoints:
+            print("No job loaded. Returning to IDLE.")
+            self._transition(RobotState.IDLE)
+            return
+        
+        waypoints = self._job_runtime.waypoints
+        show_pen_up=False
+        interval=10
+        trail=True
+
+        """
+        waypoints: list of [x, y, up] where z=0 pen down, z=1 pen up
+        show_pen_up: if True, also draw pen-up moves (dashed)
+        interval: ms between frames
+        trail: if True, path stays; if False, only current segment shows
+        """
+        wp = np.array(waypoints, dtype=float)
+        x, y, up = wp[:, 0], wp[:, 1], wp[:, 2].astype(int)
+
+        # Build segments to draw: consecutive points where pen is down during the move
+        # We'll treat the segment from k-1 -> k as "down" if z[k] == 0.
+        down_seg_idx = [k for k in range(1, len(wp)) if up[k] == 0]
+        up_seg_idx   = [k for k in range(1, len(wp)) if up[k] == 1]
+
+        fig, ax = plt.subplots()
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlim(x.min() - 5, x.max() + 5)
+        ax.set_ylim(y.min() - 5, y.max() + 5)
+        ax.invert_yaxis()  # image-style coordinates (optional). Remove if you want normal Cartesian.
+
+        # Artists
+        down_line, = ax.plot([], [], lw=1)                 # pen-down trail
+        up_line,   = ax.plot([], [], lw=1, ls="--", alpha=0.4)  # pen-up trail (optional)
+        pen_dot,   = ax.plot([], [], marker="o", markersize=4)
+
+        # Accumulated points for trails
+        down_x, down_y = [], []
+        up_x, up_y = [], []
+
+        # Make a unified frame list of "steps" = indices k meaning we process segment k-1 -> k
+        frames = list(range(1, len(wp)))
+
+        def init():
+            down_line.set_data([], [])
+            up_line.set_data([], [])
+            pen_dot.set_data([], [])
+            return down_line, up_line, pen_dot
+
+        def update(k):
+            nonlocal down_x, down_y, up_x, up_y
+
+            x0, y0 = x[k-1], y[k-1]
+            x1, y1 = x[k], y[k]
+            pen_dot.set_data([x1], [y1])
+
+            if trail is False:
+                down_x, down_y = [], []
+                up_x, up_y = [], []
+
+            if up[k] == 0:
+                # add pen-down segment
+                if not down_x:
+                    down_x.extend([x0, x1])
+                    down_y.extend([y0, y1])
+                else:
+                    down_x.append(x1)
+                    down_y.append(y1)
+            else:
+                # pen-up move
+                if show_pen_up:
+                    if not up_x:
+                        up_x.extend([x0, x1])
+                        up_y.extend([y0, y1])
+                    else:
+                        up_x.append(x1)
+                        up_y.append(y1)
+
+            down_line.set_data(down_x, down_y)
+            up_line.set_data(up_x, up_y)
+            return down_line, up_line, pen_dot
+
+        anim = FuncAnimation(fig, update, frames=frames, init_func=init,
+                            interval=interval, blit=True, repeat=False)
+        
+        # MP4 (needs ffmpeg installed)
+        anim.save("loaded_drawing.mp4", fps=60)
+
+        # GIF (needs pillow)
+        anim.save("loaded_drawing.gif", fps=60)
+        
+        plt.show()
+        print("Close the animation window to continue. You can open the saved loaded_drawing file after closing the window.")
+        
+        self._transition(RobotState.DRAWING)
+        
+        return
