@@ -14,8 +14,8 @@ def main() -> None:
         origin_base_m=np.array([0.25, -0.15, 0.0]),
         x_axis_base=np.array([1.0, 0.0, 0.0]),
         y_axis_base=np.array([0.0, 1.0, 0.0]),
-        z_pen_down_m=0.050,
-        z_pen_up_m=0.120,
+        z_pen_down_m=0.085,
+        z_pen_up_m=0.155,
     )
 
     io = QArmIO(hardware=1)  # set 0 for virtual

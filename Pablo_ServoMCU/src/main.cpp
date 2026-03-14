@@ -82,7 +82,7 @@ static constexpr uint32_t UART_BAUD = 115200;
 // -----------------------------
 // Servo safety and behavior
 // -----------------------------
-static constexpr int SERVO_HARD_MIN_DEG = 0;
+static constexpr int SERVO_HARD_MIN_DEG = 45;
 static constexpr int SERVO_HARD_MAX_DEG = 180;
 
 // These microseconds define the electrical end stops for the servo pulses.
@@ -91,8 +91,8 @@ static constexpr int SERVO_HARD_MAX_DEG = 180;
 static constexpr int SERVO_MIN_US = 800;
 static constexpr int SERVO_MAX_US = 2450;
 
-int g_softMinDeg = 20;
-int g_softMaxDeg = 160;
+int g_softMinDeg = 55;
+int g_softMaxDeg = 170;
 int g_failsafeDeg = 90;
 
 static constexpr uint32_t SERVO_UPDATE_MS = 10;
@@ -124,8 +124,8 @@ uint32_t g_lastImuUpdateMs = 0;
 
 float g_pitchDegFiltered = 0.0f;
 static constexpr float PITCH_LPF_ALPHA = 0.15f;
-static constexpr float PITCH_INPUT_MIN = -45.0f;
-static constexpr float PITCH_INPUT_MAX = 45.0f;
+static constexpr float PITCH_INPUT_MIN = -90.0f;
+static constexpr float PITCH_INPUT_MAX = 0.0f;
 
 // -----------------------------
 // Helpers
@@ -245,7 +245,8 @@ static void updateImuTarget() {
   float ay = g_imu.readFloatAccelY();
   float az = g_imu.readFloatAccelZ();
 
-  float pitchRad = atan2f(-ax, sqrtf(ay * ay + az * az));
+  // float pitchRad = atan2f(-ax, sqrtf(ay * ay + az * az));
+  float pitchRad = atan2f(-ay, sqrtf(ax * ax + az * az));
   float pitchDeg = pitchRad * 57.2957795f;
 
   g_pitchDegFiltered = (1.0f - PITCH_LPF_ALPHA) * g_pitchDegFiltered + PITCH_LPF_ALPHA * pitchDeg;
