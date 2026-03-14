@@ -362,7 +362,8 @@ class RobotController:
         ax.set_aspect("equal", adjustable="box")
         ax.set_xlim(x.min() - 0.05, x.max() + 0.05)
         ax.set_ylim(y.min() - 0.05, y.max() + 0.05)
-        ax.invert_yaxis()
+        # ax.invert_xaxis()
+        # ax.invert_yaxis()
         ax.set_title("Preview: pen-down path")
 
         down_line, = ax.plot([], [], lw=1)
