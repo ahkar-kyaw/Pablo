@@ -3,21 +3,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+
 from kinematics_engine import CartesianWaypoint, DrawingPlane, KinematicsEngine
-from tool_axis_link import ToolAxisLink
-from vision_processor import DrawingJobSpec, VisionProcessor
 from ui_handler import UIEvent, UIEventType
+from vision_processor import DrawingJobSpec, VisionProcessor
 
 
 class RobotState(Enum):
     IDLE = auto()
+    PREVIEW = auto()
     CALIBRATING = auto()
+    HOMING = auto()
     DRAWING = auto()
-    PAUSED = auto()
+    GRIP_OPENING = auto()
+    GRIP_CLOSING = auto()
+    ROTATE_EE = auto()
     EMERGENCY_STOP = auto()
 
 
@@ -29,26 +35,38 @@ class DrawingJobRuntime:
 
 
 class QArmIO:
-    def __init__(self, hardware: int = 0):
+    """
+    Wraps pal.products.qarm.QArm which exposes read_write_std, measJointPosition, measJointCurrent. :contentReference[oaicite:7]{index=7}
+    """
+
+    def __init__(self, hardware: int = 1):
         try:
             from pal.products.qarm import QArm  # type: ignore
         except Exception:
-            try:
-                from Libraries.pal.products.qarm import QArm  # type: ignore
-            except Exception as e:
-                raise ImportError("Could not import QArm. Ensure Quanser libraries are on PYTHONPATH.") from e
+            from Libraries.pal.products.qarm import QArm  # type: ignore
 
         self.arm = QArm(hardware=hardware)
         self.status_ok = True
 
+        try:
+            self.arm.read_std()
+        except Exception:
+            pass
+
     def get_joint_position(self) -> np.ndarray:
         return np.array(self.arm.measJointPosition[0:4], dtype=float).reshape(4)
 
+    def get_gripper_current(self) -> Optional[float]:
+        cur = getattr(self.arm, "measJointCurrent", None)
+        if cur is None or len(cur) < 5:
+            return None
+        return float(cur[4])
+
     def send(self, phi_cmd: np.ndarray, gripper_cmd: float, led_rgb: Optional[np.ndarray] = None) -> None:
         if led_rgb is None:
-            led_rgb = np.array([0, 0, 0], dtype=float)
-        phi_cmd = np.array(phi_cmd, dtype=float).reshape(4)
+            led_rgb = np.array([0.0, 0.0, 0.0], dtype=float)
 
+        phi_cmd = np.array(phi_cmd, dtype=float).reshape(4)
         self.arm.read_write_std(phiCMD=phi_cmd, grpCMD=float(gripper_cmd), baseLED=led_rgb)
         self.status_ok = bool(getattr(self.arm, "status", True))
 
@@ -60,35 +78,65 @@ class QArmIO:
 
 
 class RobotController:
+    # Gripper command endpoints (QArm saturates 0.1..0.9 internally) :contentReference[oaicite:8]{index=8}
+    GRIP_OPEN_CMD = 0.1
+    GRIP_MAX_CLOSE_CMD = 0.85
+
+    # Closing behavior
+    GRIP_STEP_PER_TICK = 0.01
+    GRIP_CURRENT_LIMIT_A = 1.0
+    GRIP_OVERCURRENT_COUNT = 5
+    GRIP_BACKOFF = 0.02
+    GRIP_CLOSE_TIMEOUT_S = 2.0
+
+    # Wrist rotate smoothing
+    WRIST_MAX_STEP_DEG = 5.0
+
     def __init__(
         self,
         io: QArmIO,
         kinematics: KinematicsEngine,
         vision: VisionProcessor,
         plane: DrawingPlane,
-        tool_axis: Optional[ToolAxisLink] = None,
         sample_rate_hz: float = 50.0,
     ):
         self.io = io
         self.kin = kinematics
         self.vision = vision
         self.plane = plane
-        self.tool_axis = tool_axis
 
         self.state = RobotState.IDLE
-
         self.sample_rate_hz = float(sample_rate_hz)
-        self.dt = 1.0 / self.sample_rate_hz
 
-        self._job_spec = DrawingJobSpec(mode="circle")
+        self._job_spec = DrawingJobSpec()
         self._job_runtime: Optional[DrawingJobRuntime] = None
+        self._job_dirty = True
 
-        self._last_phi_cmd = np.zeros(4, dtype=float)
-        self._last_grip_cmd = 0.1
+        # Hold pose so we never sag due to missing commands
+        q0 = self.io.get_joint_position()
+        self._last_phi_cmd = q0.copy()
+        self._last_grip_cmd = self.GRIP_OPEN_CMD
+
+        # Wrist gamma used for IK (drawing follows this)
+        self._wrist_gamma_rad = float(self._last_phi_cmd[3])
 
         self._running = True
 
+        # Home pose in task space
         self._home_xyz = np.array([0.30, -0.10, 0.20], dtype=float)
+        self._home_cycles_remaining = 0
+        self._after_home_state = RobotState.IDLE
+
+        # Preview
+        self._preview_fig = None
+        self._preview_anim = None
+
+        # Gripper close
+        self._grip_overcurrent = 0
+        self._grip_timeout_cycles = 0
+
+        # Rotate
+        self._wrist_target_rad: Optional[float] = None
 
     @property
     def running(self) -> bool:
@@ -104,96 +152,228 @@ class RobotController:
 
         if ev.event_type == UIEventType.LOAD_IMAGE_FILENAME:
             self._job_spec.image_filename = ev.payload
-            print(f"Image filename set to {ev.payload}")
+            self._job_dirty = True
+            print(f"Loaded: {ev.payload}")
             return
 
-        if ev.event_type == UIEventType.SET_MODE_CIRCLE:
-            self._job_spec.mode = "circle"
-            print("Mode set to circle")
-            return
-
-        if ev.event_type == UIEventType.SET_MODE_IMAGE:
-            self._job_spec.mode = "image"
-            print("Mode set to image")
-            return
-
-        if ev.event_type == UIEventType.EMERGENCY_STOP:
+        if ev.event_type == UIEventType.STOP:
             self._transition(RobotState.EMERGENCY_STOP)
             return
 
         if ev.event_type == UIEventType.RESET:
-            if self.state in (RobotState.EMERGENCY_STOP, RobotState.PAUSED):
-                self._job_runtime = None
+            if self.state == RobotState.EMERGENCY_STOP:
                 self._transition(RobotState.IDLE)
             return
 
-        if ev.event_type == UIEventType.PAUSE_TOGGLE:
-            if self.state == RobotState.DRAWING:
-                self._transition(RobotState.PAUSED)
-            elif self.state == RobotState.PAUSED:
-                self._transition(RobotState.DRAWING)
+        if self.state == RobotState.EMERGENCY_STOP:
+            # Ignore all commands except reset/quit/help while stopped
+            return
+
+        if ev.event_type == UIEventType.PREVIEW:
+            if self.state != RobotState.IDLE:
+                print("Preview is available from IDLE only")
+                return
+            self._transition(RobotState.PREVIEW)
             return
 
         if ev.event_type == UIEventType.START:
-            if self.state == RobotState.IDLE:
-                self._transition(RobotState.CALIBRATING)
+            if self.state != RobotState.IDLE:
+                print("Start is available from IDLE only")
+                return
+            self._transition(RobotState.CALIBRATING)
             return
 
-    def _transition(self, new_state: RobotState) -> None:
-        if new_state == self.state:
+        if ev.event_type == UIEventType.HOME:
+            if self.state != RobotState.IDLE:
+                print("Home is available from IDLE only")
+                return
+            self._after_home_state = RobotState.IDLE
+            self._home_cycles_remaining = int(2.0 * self.sample_rate_hz)
+            self._transition(RobotState.HOMING)
             return
-        print(f"STATE {self.state.name} -> {new_state.name}")
 
-        # Safety action on entry to EMERGENCY_STOP
-        if new_state == RobotState.EMERGENCY_STOP and self.tool_axis is not None:
-            self.tool_axis.force_up()
+        if ev.event_type == UIEventType.GRIP:
+            if self.state != RobotState.IDLE:
+                print("Grip is available from IDLE only")
+                return
+            if ev.payload == "open":
+                self._transition(RobotState.GRIP_OPENING)
+            elif ev.payload == "close":
+                self._grip_overcurrent = 0
+                self._grip_timeout_cycles = int(self.GRIP_CLOSE_TIMEOUT_S * self.sample_rate_hz)
+                self._transition(RobotState.GRIP_CLOSING)
+            return
 
-        self.state = new_state
+        if ev.event_type == UIEventType.ROTATE_WRIST_DEG:
+            if self.state != RobotState.IDLE:
+                print("Rotate is available from IDLE only")
+                return
+            tgt = self._parse_rotate_payload(ev.payload or "")
+            if tgt is None:
+                return
+            self._wrist_target_rad = tgt
+            self._transition(RobotState.ROTATE_EE)
+            return
 
     def update(self) -> None:
         if self.state == RobotState.IDLE:
             self._idle_step()
+        elif self.state == RobotState.PREVIEW:
+            self._preview_step()
         elif self.state == RobotState.CALIBRATING:
             self._calibrating_step()
+        elif self.state == RobotState.HOMING:
+            self._homing_step()
         elif self.state == RobotState.DRAWING:
             self._drawing_step()
-        elif self.state == RobotState.PAUSED:
-            self._paused_step()
+        elif self.state == RobotState.GRIP_OPENING:
+            self._grip_open_step()
+        elif self.state == RobotState.GRIP_CLOSING:
+            self._grip_close_step()
+        elif self.state == RobotState.ROTATE_EE:
+            self._rotate_step()
         elif self.state == RobotState.EMERGENCY_STOP:
             self._estop_step()
 
-    def _idle_step(self) -> None:
-        led = np.array([0, 1, 0], dtype=float)
-        self.io.send(self._last_phi_cmd, self._last_grip_cmd, led_rgb=led)
-
-    def _calibrating_step(self) -> None:
-        led = np.array([0, 0, 1], dtype=float)
-
-        q_prev = self.io.get_joint_position()
-        try:
-            phi_cmd = self.kin.ik(self._home_xyz, q_prev)
-        except Exception as e:
-            print(f"Calibration IK failed: {e}")
-            self._transition(RobotState.EMERGENCY_STOP)
+    def _transition(self, new_state: RobotState) -> None:
+        if new_state == self.state:
             return
 
-        self._last_phi_cmd = phi_cmd
-        self._last_grip_cmd = 0.1
-        self.io.send(phi_cmd, self._last_grip_cmd, led_rgb=led)
+        print(f"STATE {self.state.name} -> {new_state.name}")
+
+        if self.state == RobotState.PREVIEW and new_state != RobotState.PREVIEW:
+            self._stop_preview()
+
+        self.state = new_state
+
+    def _send_hold(self, led: np.ndarray) -> None:
+        self.io.send(self._last_phi_cmd, self._last_grip_cmd, led_rgb=led)
+
+    def _idle_step(self) -> None:
+        self._send_hold(np.array([0.0, 1.0, 0.0], dtype=float))
+
+    def _calibrating_step(self) -> None:
+        if not getattr(self._job_spec, "image_filename", None):
+            print("No image loaded. Use load <filename> first")
+            self._transition(RobotState.IDLE)
+            return
 
         try:
-            planar = self.vision.build_planar_waypoints(self._job_spec)
-            cart = self.kin.planar_to_cartesian(self.plane, planar)
-            self._job_runtime = DrawingJobRuntime(job=self._job_spec, waypoints=cart, index=0)
+            self._prepare_job_if_needed()
         except Exception as e:
             print(f"Failed to build drawing job: {e}")
             self._transition(RobotState.EMERGENCY_STOP)
             return
 
-        self._transition(RobotState.DRAWING)
+        # Home before drawing, using current wrist gamma
+        self._after_home_state = RobotState.DRAWING
+        self._home_cycles_remaining = int(2.0 * self.sample_rate_hz)
+        self._transition(RobotState.HOMING)
+
+    def _homing_step(self) -> None:
+        led = np.array([0.0, 0.5, 1.0], dtype=float)
+        q_prev = self.io.get_joint_position()
+        try:
+            phi_cmd = self.kin.ik(self._home_xyz, q_prev, gamma_rad=self._wrist_gamma_rad)
+        except Exception as e:
+            print(f"Homing IK failed: {e}")
+            self._transition(RobotState.EMERGENCY_STOP)
+            return
+
+        self._last_phi_cmd = phi_cmd
+        self.io.send(self._last_phi_cmd, self._last_grip_cmd, led_rgb=led)
+
+        self._home_cycles_remaining = max(0, self._home_cycles_remaining - 1)
+        if self._home_cycles_remaining == 0:
+            self._transition(self._after_home_state)
+
+    def _preview_step(self) -> None:
+        led = np.array([0.6, 0.6, 0.0], dtype=float)
+
+        # Keep holding pose so the robot never droops during preview
+        self._send_hold(led)
+
+        if self._preview_fig is None:
+            try:
+                self._prepare_job_if_needed()
+                assert self._job_runtime is not None
+                self._start_preview(self._job_runtime.waypoints)
+                print("Preview running. Close the preview window to return to IDLE.")
+            except Exception as e:
+                print(f"Preview failed: {e}")
+                self._transition(RobotState.IDLE)
+                return
+
+        try:
+            plt.pause(0.001)
+        except Exception:
+            pass
+
+        try:
+            if self._preview_fig is not None and not plt.fignum_exists(self._preview_fig.number):
+                self._stop_preview()
+                self._transition(RobotState.IDLE)
+        except Exception:
+            self._stop_preview()
+            self._transition(RobotState.IDLE)
+
+    def _start_preview(self, waypoints: List[CartesianWaypoint]) -> None:
+        wp = np.array([[w.x_m, w.y_m, 0.0 if w.pen_down else 1.0] for w in waypoints], dtype=float)
+        x, y, up = wp[:, 0], wp[:, 1], wp[:, 2].astype(int)
+
+        fig, ax = plt.subplots()
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlim(x.min() - 0.05, x.max() + 0.05)
+        ax.set_ylim(y.min() - 0.05, y.max() + 0.05)
+        ax.invert_yaxis()
+        ax.set_title("Preview: pen-down path")
+
+        down_line, = ax.plot([], [], lw=1)
+        pen_dot, = ax.plot([], [], marker="o", markersize=4)
+
+        down_x: List[float] = []
+        down_y: List[float] = []
+        frames = list(range(1, len(wp)))
+
+        def init():
+            down_line.set_data([], [])
+            pen_dot.set_data([], [])
+            return down_line, pen_dot
+
+        def update(k):
+            nonlocal down_x, down_y
+            x0, y0 = x[k - 1], y[k - 1]
+            x1, y1 = x[k], y[k]
+            pen_dot.set_data([x1], [y1])
+
+            if up[k] == 0:
+                if not down_x:
+                    down_x.extend([x0, x1])
+                    down_y.extend([y0, y1])
+                else:
+                    down_x.append(x1)
+                    down_y.append(y1)
+
+            down_line.set_data(down_x, down_y)
+            return down_line, pen_dot
+
+        anim = FuncAnimation(fig, update, frames=frames, init_func=init, interval=10, blit=True, repeat=False)
+
+        self._preview_fig = fig
+        self._preview_anim = anim
+        plt.show(block=False)
+
+    def _stop_preview(self) -> None:
+        if self._preview_fig is not None:
+            try:
+                plt.close(self._preview_fig)
+            except Exception:
+                pass
+        self._preview_fig = None
+        self._preview_anim = None
 
     def _drawing_step(self) -> None:
-        led = np.array([1, 1, 1], dtype=float)
+        led = np.array([1.0, 1.0, 1.0], dtype=float)
 
         if self._job_runtime is None or not self._job_runtime.waypoints:
             print("No job loaded. Returning to IDLE.")
@@ -202,35 +382,101 @@ class RobotController:
 
         if self._job_runtime.index >= len(self._job_runtime.waypoints):
             print("Drawing complete.")
-            self._transition(RobotState.IDLE)
             self._job_runtime = None
+            self._transition(RobotState.IDLE)
             return
 
         wp = self._job_runtime.waypoints[self._job_runtime.index]
         q_prev = self.io.get_joint_position()
 
         try:
-            phi_cmd = self.kin.ik(np.array([wp.x_m, wp.y_m, wp.z_m], dtype=float), q_prev)
+            # Wrist gamma enforced here so drawing follows your rotate command
+            phi_cmd = self.kin.ik(
+                np.array([wp.x_m, wp.y_m, wp.z_m], dtype=float),
+                q_prev,
+                gamma_rad=self._wrist_gamma_rad,
+            )
         except Exception as e:
             print(f"Drawing IK failed at index {self._job_runtime.index}: {e}")
             self._transition(RobotState.EMERGENCY_STOP)
             return
 
-        grip = 0.1
         self._last_phi_cmd = phi_cmd
-        self._last_grip_cmd = grip
-        self.io.send(phi_cmd, grip, led_rgb=led)
-
-        # Optional tool axis command tied to pen state
-        if self.tool_axis is not None:
-            self.tool_axis.send_pen_state(wp.pen_down)
+        self.io.send(self._last_phi_cmd, self._last_grip_cmd, led_rgb=led)
 
         self._job_runtime.index += 1
 
-    def _paused_step(self) -> None:
-        led = np.array([1, 1, 0], dtype=float)
+    def _grip_open_step(self) -> None:
+        led = np.array([0.8, 0.2, 0.8], dtype=float)
+        self._last_grip_cmd = self.GRIP_OPEN_CMD
+        self.io.send(self._last_phi_cmd, self._last_grip_cmd, led_rgb=led)
+        self._transition(RobotState.IDLE)
+
+    def _grip_close_step(self) -> None:
+        led = np.array([0.8, 0.2, 0.8], dtype=float)
+
+        # Ramp toward close, capped
+        self._last_grip_cmd = min(self.GRIP_MAX_CLOSE_CMD, self._last_grip_cmd + self.GRIP_STEP_PER_TICK)
         self.io.send(self._last_phi_cmd, self._last_grip_cmd, led_rgb=led)
 
-    def _estop_step(self) -> None:
-        led = np.array([1, 0, 0], dtype=float)
+        cur = self.io.get_gripper_current()
+        if cur is not None and cur > self.GRIP_CURRENT_LIMIT_A:
+            self._grip_overcurrent += 1
+        else:
+            self._grip_overcurrent = 0
+
+        self._grip_timeout_cycles = max(0, self._grip_timeout_cycles - 1)
+
+        if self._grip_overcurrent >= self.GRIP_OVERCURRENT_COUNT or self._grip_timeout_cycles == 0:
+            # Back off slightly to reduce sustained load but keep grip
+            self._last_grip_cmd = max(self.GRIP_OPEN_CMD, self._last_grip_cmd - self.GRIP_BACKOFF)
+            self.io.send(self._last_phi_cmd, self._last_grip_cmd, led_rgb=led)
+            self._transition(RobotState.IDLE)
+
+    def _rotate_step(self) -> None:
+        led = np.array([0.2, 0.8, 0.8], dtype=float)
+
+        if self._wrist_target_rad is None:
+            self._transition(RobotState.IDLE)
+            return
+
+        target = float(np.arctan2(np.sin(self._wrist_target_rad), np.cos(self._wrist_target_rad)))
+        cur = float(self._last_phi_cmd[3])
+
+        max_step = float(np.deg2rad(self.WRIST_MAX_STEP_DEG))
+        step = float(np.clip(target - cur, -max_step, max_step))
+
+        q_cmd = self._last_phi_cmd.copy()
+        q_cmd[3] = cur + step
+
+        self._last_phi_cmd = q_cmd
         self.io.send(self._last_phi_cmd, self._last_grip_cmd, led_rgb=led)
+
+        if abs(target - float(self._last_phi_cmd[3])) < float(np.deg2rad(1.0)):
+            # Persist wrist gamma for subsequent drawing
+            self._wrist_gamma_rad = float(self._last_phi_cmd[3])
+            self._transition(RobotState.IDLE)
+
+    def _estop_step(self) -> None:
+        # Freeze by holding last commanded pose
+        self._send_hold(np.array([1.0, 0.0, 0.0], dtype=float))
+
+    def _prepare_job_if_needed(self) -> None:
+        if self._job_runtime is not None and not self._job_dirty:
+            return
+
+        planar = self.vision.build_planar_waypoints(self._job_spec)
+        cart = self.kin.planar_to_cartesian(self.plane, planar)
+        self._job_runtime = DrawingJobRuntime(job=self._job_spec, waypoints=cart, index=0)
+        self._job_dirty = False
+
+    def _parse_rotate_payload(self, s: str) -> Optional[float]:
+        s = s.strip()
+        if not s:
+            return None
+        try:
+            deg = float(s)
+        except Exception:
+            print("Invalid rotate value")
+            return None
+        return float(np.deg2rad(deg))
