@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 
@@ -36,7 +36,7 @@ class DrawingJobRuntime:
 
 class QArmIO:
     """
-    Wraps pal.products.qarm.QArm which exposes read_write_std, measJointPosition, measJointCurrent. :contentReference[oaicite:7]{index=7}
+    Wraps pal.products.qarm.QArm.
     """
 
     def __init__(self, hardware: int = 1):
@@ -55,6 +55,12 @@ class QArmIO:
 
     def get_joint_position(self) -> np.ndarray:
         return np.array(self.arm.measJointPosition[0:4], dtype=float).reshape(4)
+
+    def get_joint_currents(self) -> Optional[np.ndarray]:
+        cur = getattr(self.arm, "measJointCurrent", None)
+        if cur is None or len(cur) < 4:
+            return None
+        return np.array(cur[0:4], dtype=float).reshape(4)
 
     def get_gripper_current(self) -> Optional[float]:
         cur = getattr(self.arm, "measJointCurrent", None)
@@ -78,11 +84,11 @@ class QArmIO:
 
 
 class RobotController:
-    # Gripper command endpoints (QArm saturates 0.1..0.9 internally) :contentReference[oaicite:8]{index=8}
+    # Gripper commands
     GRIP_OPEN_CMD = 0.1
     GRIP_MAX_CLOSE_CMD = 0.85
 
-    # Closing behavior
+    # Gripper closing behavior
     GRIP_STEP_PER_TICK = 0.01
     GRIP_CURRENT_LIMIT_A = 1.0
     GRIP_OVERCURRENT_COUNT = 5
@@ -91,6 +97,24 @@ class RobotController:
 
     # Wrist rotate smoothing
     WRIST_MAX_STEP_DEG = 5.0
+
+    # Z compliance
+    Z_COMPLIANCE_ENABLED = True
+
+    # Contact detect uses joint currents as a proxy for contact force
+    CONTACT_CURRENT_RISE_A = 0.35
+    CONTACT_HYSTERESIS_A = 0.10
+
+    # Descent step and compliance gain
+    Z_DESCENT_STEP_M = 0.0008
+    Z_ADMITTANCE_M_PER_A = 0.0009
+
+    # Clamp around contact Z to avoid digging into the surface
+    Z_ABOVE_CONTACT_MAX_M = 0.006
+    Z_BELOW_CONTACT_MAX_M = 0.001
+
+    # Filter to avoid noisy thresholds
+    CURRENT_LPF_ALPHA = 0.25
 
     def __init__(
         self,
@@ -112,12 +136,11 @@ class RobotController:
         self._job_runtime: Optional[DrawingJobRuntime] = None
         self._job_dirty = True
 
-        # Hold pose so we never sag due to missing commands
         q0 = self.io.get_joint_position()
         self._last_phi_cmd = q0.copy()
         self._last_grip_cmd = self.GRIP_OPEN_CMD
 
-        # Wrist gamma used for IK (drawing follows this)
+        # Wrist gamma used for IK during home and drawing
         self._wrist_gamma_rad = float(self._last_phi_cmd[3])
 
         self._running = True
@@ -137,6 +160,14 @@ class RobotController:
 
         # Rotate
         self._wrist_target_rad: Optional[float] = None
+
+        # Z compliance runtime
+        self._contact_active = False
+        self._contact_z_m: Optional[float] = None
+        self._z_cmd_m = float(self.plane.z_pen_up_m)
+
+        self._baseline_current: Optional[float] = None
+        self._filtered_current = 0.0
 
     @property
     def running(self) -> bool:
@@ -166,7 +197,6 @@ class RobotController:
             return
 
         if self.state == RobotState.EMERGENCY_STOP:
-            # Ignore all commands except reset/quit/help while stopped
             return
 
         if ev.event_type == UIEventType.PREVIEW:
@@ -244,7 +274,17 @@ class RobotController:
         if self.state == RobotState.PREVIEW and new_state != RobotState.PREVIEW:
             self._stop_preview()
 
+        if new_state in (RobotState.IDLE, RobotState.EMERGENCY_STOP):
+            self._reset_contact_state()
+
         self.state = new_state
+
+    def _reset_contact_state(self) -> None:
+        self._contact_active = False
+        self._contact_z_m = None
+        self._z_cmd_m = float(self.plane.z_pen_up_m)
+        self._baseline_current = None
+        self._filtered_current = 0.0
 
     def _send_hold(self, led: np.ndarray) -> None:
         self.io.send(self._last_phi_cmd, self._last_grip_cmd, led_rgb=led)
@@ -265,7 +305,6 @@ class RobotController:
             self._transition(RobotState.EMERGENCY_STOP)
             return
 
-        # Home before drawing, using current wrist gamma
         self._after_home_state = RobotState.DRAWING
         self._home_cycles_remaining = int(2.0 * self.sample_rate_hz)
         self._transition(RobotState.HOMING)
@@ -289,8 +328,6 @@ class RobotController:
 
     def _preview_step(self) -> None:
         led = np.array([0.6, 0.6, 0.0], dtype=float)
-
-        # Keep holding pose so the robot never droops during preview
         self._send_hold(led)
 
         if self._preview_fig is None:
@@ -383,28 +420,123 @@ class RobotController:
         if self._job_runtime.index >= len(self._job_runtime.waypoints):
             print("Drawing complete.")
             self._job_runtime = None
+            self._reset_contact_state()
             self._transition(RobotState.IDLE)
             return
 
         wp = self._job_runtime.waypoints[self._job_runtime.index]
-        q_prev = self.io.get_joint_position()
 
+        if not wp.pen_down or not self.Z_COMPLIANCE_ENABLED:
+            if not wp.pen_down:
+                self._reset_contact_state()
+
+            q_prev = self.io.get_joint_position()
+            try:
+                phi_cmd = self.kin.ik(
+                    np.array([wp.x_m, wp.y_m, wp.z_m], dtype=float),
+                    q_prev,
+                    gamma_rad=self._wrist_gamma_rad,
+                )
+            except Exception as e:
+                print(f"Drawing IK failed at index {self._job_runtime.index}: {e}")
+                self._transition(RobotState.EMERGENCY_STOP)
+                return
+
+            self._last_phi_cmd = phi_cmd
+            self.io.send(self._last_phi_cmd, self._last_grip_cmd, led_rgb=led)
+            self._job_runtime.index += 1
+            return
+
+        # Pen down with compliance
+        metric = self._read_contact_metric()
+        if self._baseline_current is None:
+            self._baseline_current = metric
+
+        if not self._contact_active:
+            # Touch down phase
+            self._z_cmd_m = min(self._z_cmd_m, float(self.plane.z_pen_up_m))
+            next_z = self._z_cmd_m - self.Z_DESCENT_STEP_M
+            z_min = float(self.plane.z_pen_down_m)
+            if next_z < z_min:
+                next_z = z_min
+
+            q_prev = self.io.get_joint_position()
+            try:
+                phi_cmd = self.kin.ik(
+                    np.array([wp.x_m, wp.y_m, next_z], dtype=float),
+                    q_prev,
+                    gamma_rad=self._wrist_gamma_rad,
+                )
+            except Exception as e:
+                print(f"Touch down IK failed: {e}")
+                self._transition(RobotState.EMERGENCY_STOP)
+                return
+
+            self._last_phi_cmd = phi_cmd
+            self._z_cmd_m = float(next_z)
+            self.io.send(self._last_phi_cmd, self._last_grip_cmd, led_rgb=led)
+
+            metric_after = self._read_contact_metric()
+            rise = metric_after - float(self._baseline_current)
+
+            if rise > self.CONTACT_CURRENT_RISE_A or abs(self._z_cmd_m - z_min) < 1e-6:
+                self._contact_active = True
+                self._contact_z_m = float(self._z_cmd_m)
+
+            return
+
+        # Compliant draw phase
+        assert self._contact_z_m is not None
+        metric = self._read_contact_metric()
+        rise = metric - float(self._baseline_current)
+
+        target_rise = self.CONTACT_CURRENT_RISE_A
+        error = rise - target_rise
+
+        z_adjust = self.Z_ADMITTANCE_M_PER_A * error
+        z_next = self._z_cmd_m + z_adjust
+
+        z_upper = self._contact_z_m + self.Z_ABOVE_CONTACT_MAX_M
+        z_lower = self._contact_z_m - self.Z_BELOW_CONTACT_MAX_M
+        z_next = float(np.clip(z_next, z_lower, z_upper))
+
+        q_prev = self.io.get_joint_position()
         try:
-            # Wrist gamma enforced here so drawing follows your rotate command
             phi_cmd = self.kin.ik(
-                np.array([wp.x_m, wp.y_m, wp.z_m], dtype=float),
+                np.array([wp.x_m, wp.y_m, z_next], dtype=float),
                 q_prev,
                 gamma_rad=self._wrist_gamma_rad,
             )
         except Exception as e:
-            print(f"Drawing IK failed at index {self._job_runtime.index}: {e}")
+            print(f"Compliant draw IK failed at index {self._job_runtime.index}: {e}")
             self._transition(RobotState.EMERGENCY_STOP)
             return
 
         self._last_phi_cmd = phi_cmd
+        self._z_cmd_m = float(z_next)
         self.io.send(self._last_phi_cmd, self._last_grip_cmd, led_rgb=led)
 
+        # If contact is lost, re enter touch down
+        if rise < (target_rise - self.CONTACT_HYSTERESIS_A):
+            self._contact_active = False
+
         self._job_runtime.index += 1
+
+    def _read_contact_metric(self) -> float:
+        """
+        Contact proxy metric from joint currents.
+        Uses joints 2 and 3 since they react strongly to vertical contact at the tip.
+        """
+        cur = self.io.get_joint_currents()
+        if cur is None:
+            return 0.0
+
+        metric_raw = float(abs(cur[1]) + abs(cur[2]))
+        self._filtered_current = (
+            (1.0 - self.CURRENT_LPF_ALPHA) * self._filtered_current
+            + self.CURRENT_LPF_ALPHA * metric_raw
+        )
+        return float(self._filtered_current)
 
     def _grip_open_step(self) -> None:
         led = np.array([0.8, 0.2, 0.8], dtype=float)
@@ -415,7 +547,6 @@ class RobotController:
     def _grip_close_step(self) -> None:
         led = np.array([0.8, 0.2, 0.8], dtype=float)
 
-        # Ramp toward close, capped
         self._last_grip_cmd = min(self.GRIP_MAX_CLOSE_CMD, self._last_grip_cmd + self.GRIP_STEP_PER_TICK)
         self.io.send(self._last_phi_cmd, self._last_grip_cmd, led_rgb=led)
 
@@ -428,7 +559,6 @@ class RobotController:
         self._grip_timeout_cycles = max(0, self._grip_timeout_cycles - 1)
 
         if self._grip_overcurrent >= self.GRIP_OVERCURRENT_COUNT or self._grip_timeout_cycles == 0:
-            # Back off slightly to reduce sustained load but keep grip
             self._last_grip_cmd = max(self.GRIP_OPEN_CMD, self._last_grip_cmd - self.GRIP_BACKOFF)
             self.io.send(self._last_phi_cmd, self._last_grip_cmd, led_rgb=led)
             self._transition(RobotState.IDLE)
@@ -453,12 +583,10 @@ class RobotController:
         self.io.send(self._last_phi_cmd, self._last_grip_cmd, led_rgb=led)
 
         if abs(target - float(self._last_phi_cmd[3])) < float(np.deg2rad(1.0)):
-            # Persist wrist gamma for subsequent drawing
             self._wrist_gamma_rad = float(self._last_phi_cmd[3])
             self._transition(RobotState.IDLE)
 
     def _estop_step(self) -> None:
-        # Freeze by holding last commanded pose
         self._send_hold(np.array([1.0, 0.0, 0.0], dtype=float))
 
     def _prepare_job_if_needed(self) -> None:
@@ -469,6 +597,8 @@ class RobotController:
         cart = self.kin.planar_to_cartesian(self.plane, planar)
         self._job_runtime = DrawingJobRuntime(job=self._job_spec, waypoints=cart, index=0)
         self._job_dirty = False
+
+        self._reset_contact_state()
 
     def _parse_rotate_payload(self, s: str) -> Optional[float]:
         s = s.strip()
